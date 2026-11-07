@@ -3,10 +3,18 @@ import { Capacitor } from '@capacitor/core';
 import { App } from '@capacitor/app';
 import { Filesystem, Directory } from '@capacitor/filesystem';
 import { Share } from '@capacitor/share';
+import { StatusBar, Style } from '@capacitor/status-bar';
 
 window.KLEREK_NATIVE = Capacitor.isNativePlatform();
 window.__KLEREK_PENDING_AUTH_URLS = window.__KLEREK_PENDING_AUTH_URLS || [];
 if (window.KLEREK_NATIVE) {
+  // Android 15/16 mengaktifkan edge-to-edge: StatusBar overlay:false dapat diabaikan.
+  // HTML juga menyediakan top inset cadangan (klerek-native) agar header tidak tertutup status bar.
+  document.documentElement.classList.add('klerek-native');
+  StatusBar.setStyle({ style: Style.Dark }).catch(() => {});
+  StatusBar.setOverlaysWebView({ overlay: false }).catch(() => {});
+  StatusBar.setBackgroundColor({ color: '#071321' }).catch(() => {});
+
   // Simpan callback sementara apabila Supabase client belum siap.
   function incoming(url) {
     if (typeof url !== 'string' || !url.startsWith('com.alfianwahyu63.klerekkasir://auth-callback')) return;
