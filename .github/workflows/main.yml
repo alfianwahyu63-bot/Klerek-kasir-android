@@ -23,7 +23,7 @@ jobs:
           distribution: temurin
           java-version: '21'
       - name: Siapkan Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
       - name: Instal library Android
         run: npm install --no-audit --no-fund
       - name: Build web yang tertanam di APK
