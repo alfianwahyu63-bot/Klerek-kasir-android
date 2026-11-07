@@ -1,0 +1,280 @@
+-- FIX v4.0.1: memperbaiki syntax error di baris ekstraksi tanggal menggunakan pg_catalog.substr(text, start, length).
+-- Aman dijalankan ulang setelah error v4.0.0; objek dibuat secara idempotent.
+-- KLEREK KASIR v4.0 | PATCH fiturnya: penugasan slot, tutup shift, approval,
+-- audit siapa mengubah, backup per hari, peran multiuser. Jalankan setelah SQL v3.5
+-- dan patch 2 kasir sebelumnya sukses. Tidak menghapus data lama.
+-- Periksa hasil SQL sebelum operasional. Dilarang menggunakan secret/service role di browser.
+
+create table if not exists public.klerek_assignments (
+ store_id uuid not null references public.klerek_stores(id) on delete cascade,
+ user_id uuid not null references auth.users(id) on delete cascade,
+ shift smallint not null check(shift between 1 and 3),
+ slot smallint not null check(slot between 1 and 2),
+ assigned_at timestamptz not null default now(),
+ primary key(store_id,user_id),
+ unique(store_id,shift,slot)
+);
+create table if not exists public.klerek_workflows (
+ store_id uuid not null references public.klerek_stores(id) on delete cascade,
+ work_date date not null,
+ shift smallint not null check(shift between 1 and 3),
+ slot smallint not null check(slot between 1 and 2),
+ status text not null default 'draft' check(status in ('draft','submitted','revision','approved')),
+ actual_net bigint,
+ review_note text not null default '',
+ revision bigint not null default 1,
+ submitted_by uuid references auth.users(id),
+ reviewed_by uuid references auth.users(id),
+ updated_at timestamptz not null default now(),
+ primary key(store_id,work_date,shift,slot)
+);
+create index if not exists klerek_workflows_day_idx on public.klerek_workflows(store_id,work_date);
+create table if not exists public.klerek_audit (
+ id bigint generated always as identity primary key,
+ store_id uuid not null references public.klerek_stores(id) on delete cascade,
+ actor uuid not null references auth.users(id),
+ item_key text not null,
+ action text not null,
+ before_summary jsonb,
+ after_summary jsonb,
+ occurred_at timestamptz not null default now()
+);
+create index if not exists klerek_audit_recent_idx on public.klerek_audit(store_id,occurred_at desc);
+create table if not exists public.klerek_backups (
+ store_id uuid not null references public.klerek_stores(id) on delete cascade,
+ work_date date not null,
+ snapshot jsonb not null,
+ created_by uuid not null references auth.users(id),
+ created_at timestamptz not null default now(),
+ primary key(store_id,work_date)
+);
+
+alter table public.klerek_assignments enable row level security;
+alter table public.klerek_workflows enable row level security;
+alter table public.klerek_audit enable row level security;
+alter table public.klerek_backups enable row level security;
+revoke all on public.klerek_assignments, public.klerek_workflows, public.klerek_audit, public.klerek_backups from anon,authenticated;
+grant select on public.klerek_assignments, public.klerek_workflows, public.klerek_audit, public.klerek_backups to authenticated;
+
+drop policy if exists klerek_assignment_member on public.klerek_assignments;
+create policy klerek_assignment_member on public.klerek_assignments for select to authenticated
+ using(public.klerek_is_member(store_id));
+drop policy if exists klerek_workflow_member on public.klerek_workflows;
+create policy klerek_workflow_member on public.klerek_workflows for select to authenticated
+ using(public.klerek_is_member(store_id));
+drop policy if exists klerek_audit_management on public.klerek_audit;
+create policy klerek_audit_management on public.klerek_audit for select to authenticated
+ using(exists(select 1 from public.klerek_members m where m.store_id=klerek_audit.store_id and m.user_id=(select auth.uid()) and m.role in ('admin','kepala_toko')));
+drop policy if exists klerek_backup_management on public.klerek_backups;
+create policy klerek_backup_management on public.klerek_backups for select to authenticated
+ using(exists(select 1 from public.klerek_members m where m.store_id=klerek_backups.store_id and m.user_id=(select auth.uid()) and m.role in ('admin','kepala_toko')));
+
+-- Hindari seluruh RPC berjalan tanpa login atau tanpa role admin saat mengatur slot.
+create or replace function public.klerek_assign_slot(p_store_id uuid,p_user_id uuid,p_shift smallint,p_slot smallint)
+returns void language plpgsql security definer set search_path='' as $$
+begin
+ if not exists(select 1 from public.klerek_members where store_id=p_store_id and user_id=auth.uid() and role='admin') then raise exception 'Hanya admin dapat membagi slot';end if;
+ if p_shift not between 1 and 3 or p_slot not between 1 and 2 then raise exception 'Slot maksimal 2 per shift';end if;
+ if not exists(select 1 from public.klerek_members where store_id=p_store_id and user_id=p_user_id and role='kasir') then raise exception 'Akun harus anggota berperan Kasir';end if;
+ -- Jika sudah ada penugasan ke slot itu, lepas penugasan lama terlebih dahulu.
+ delete from public.klerek_assignments where store_id=p_store_id and (user_id=p_user_id or (shift=p_shift and slot=p_slot));
+ insert into public.klerek_assignments(store_id,user_id,shift,slot) values(p_store_id,p_user_id,p_shift,p_slot);
+ insert into public.klerek_audit(store_id,actor,item_key,action,after_summary)
+ values(p_store_id,auth.uid(),'assign:'||p_shift||':'||p_slot,'ASSIGN',pg_catalog.jsonb_build_object('user_id',p_user_id));
+end $$;
+create or replace function public.klerek_unassign_slot(p_store_id uuid,p_shift smallint,p_slot smallint)
+returns void language plpgsql security definer set search_path='' as $$
+begin
+ if not exists(select 1 from public.klerek_members where store_id=p_store_id and user_id=auth.uid() and role='admin') then raise exception 'Hanya admin';end if;
+ delete from public.klerek_assignments where store_id=p_store_id and shift=p_shift and slot=p_slot;
+ insert into public.klerek_audit(store_id,actor,item_key,action) values(p_store_id,auth.uid(),'assign:'||p_shift||':'||p_slot,'UNASSIGN');
+end $$;
+
+-- Satu fungsi khusus workflow; cek peran & penugasan pada server (bukan hanya tombol UI).
+create or replace function public.klerek_workflow_action(
+ p_store_id uuid,p_work_date date,p_shift smallint,p_slot smallint,
+ p_action text,p_actual_net bigint default null,p_note text default null,p_expected_revision bigint default 0
+) returns table(status text,revision bigint,actual_net bigint)
+language plpgsql security definer set search_path='' as $$
+declare v_role text;v_status text;v_rev bigint;v_actual bigint;v_new_status text;
+begin
+ select m.role into v_role from public.klerek_members m where m.store_id=p_store_id and m.user_id=auth.uid();
+ if v_role is null then raise exception 'Tidak ada akses toko';end if;
+ if p_shift not between 1 and 3 or p_slot not between 1 and 2 then raise exception 'Slot tidak valid';end if;
+ if p_work_date < date '2020-01-01' or p_work_date > current_date + 366 then raise exception 'Tanggal tidak valid';end if;
+ if p_action not in ('submit','approve','reject','reopen') then raise exception 'Aksi tidak dikenal';end if;
+ if v_role='kasir' and (p_action<>'submit' or not exists(select 1 from public.klerek_assignments a where a.store_id=p_store_id and a.user_id=auth.uid() and a.shift=p_shift and a.slot=p_slot)) then raise exception 'Aksi hanya untuk kasir yang ditugaskan';end if;
+ if p_action='reopen' and v_role<>'admin' then raise exception 'Hanya admin boleh buka laporan disetujui';end if;
+ if p_action in ('approve','reject') and v_role not in ('admin','kepala_toko') then raise exception 'Hanya kepala toko/admin boleh memeriksa';end if;
+ if p_action='submit' and not exists(select 1 from public.klerek_documents d where d.store_id=p_store_id and d.doc_key=('cashier:'||p_work_date::text||':'||p_shift||':'||p_slot)) then raise exception 'Isi dan sinkronkan data kasir sebelum submit';end if;
+ select w.status,w.revision,w.actual_net into v_status,v_rev,v_actual from public.klerek_workflows w
+ where w.store_id=p_store_id and w.work_date=p_work_date and w.shift=p_shift and w.slot=p_slot for update;
+ if coalesce(v_rev,0)<>coalesce(p_expected_revision,-1) then raise exception 'WORKFLOW_CONFLICT';end if;
+ if p_action='submit' and coalesce(v_status,'draft') not in ('draft','revision') then raise exception 'Laporan sudah dikirim';end if;
+ if p_action in ('approve','reject') and v_status<>'submitted' then raise exception 'Hanya laporan terkirim yang dapat diperiksa';end if;
+ if p_action='reopen' and v_status<>'approved' then raise exception 'Hanya laporan disetujui yang dapat dibuka';end if;
+ if p_action='approve' and p_actual_net is null then raise exception 'Masukkan kas aktual sebelum setujui';end if;
+ if p_action='reject' and length(trim(coalesce(p_note,'')))<3 then raise exception 'Alasan revisi minimal 3 karakter';end if;
+ v_new_status=case when p_action='submit' then 'submitted' when p_action='approve' then 'approved' else 'revision' end;
+ insert into public.klerek_workflows as w(store_id,work_date,shift,slot,status,actual_net,review_note,revision,submitted_by,reviewed_by)
+ values(p_store_id,p_work_date,p_shift,p_slot,v_new_status,
+ case when p_action='approve' then p_actual_net else null end, left(coalesce(p_note,''),500),1,
+ case when p_action='submit' then auth.uid() else null end,case when p_action in ('approve','reject','reopen') then auth.uid() else null end)
+ on conflict(store_id,work_date,shift,slot) do update
+ set status=excluded.status,actual_net=excluded.actual_net,review_note=excluded.review_note,
+ revision=w.revision+1,submitted_by=case when p_action='submit' then auth.uid() else w.submitted_by end,
+ reviewed_by=case when p_action in ('approve','reject','reopen') then auth.uid() else w.reviewed_by end,updated_at=now()
+ where w.revision=p_expected_revision
+ returning w.revision into v_rev;
+ if not found then raise exception 'WORKFLOW_CONFLICT';end if;
+ insert into public.klerek_audit(store_id,actor,item_key,action,before_summary,after_summary)
+ values(p_store_id,auth.uid(),('cashier:'||p_work_date||':'||p_shift||':'||p_slot),upper(p_action),
+ pg_catalog.jsonb_build_object('status',coalesce(v_status,'draft')),
+ pg_catalog.jsonb_build_object('status',v_new_status,'actual_net',p_actual_net,'note',left(coalesce(p_note,''),500)));
+ return query select v_new_status,v_rev,case when p_action='approve' then p_actual_net else null end;
+end $$;
+
+-- Replace RPC lama untuk validasi 2 kasir, lock laporan, cek slot assigned & log perubahan.
+-- RLS SELECT tetap seperti SQL awal. RPC mencegah cross-store / cross-slot di sisi server.
+create or replace function public.klerek_put_document(
+ p_store_id uuid,p_doc_key text,p_payload jsonb,p_expected_revision bigint
+) returns table(revision bigint,updated_at timestamptz)
+language plpgsql security definer set search_path='' as $$
+declare v_role text;v_rev bigint;v_time timestamptz;v_existing bigint;
+ v_shift smallint;v_slot smallint;v_day date;v_old jsonb;v_is_cash boolean;
+begin
+ if auth.uid() is null then raise exception 'Login diperlukan';end if;
+ select m.role into v_role from public.klerek_members m where m.store_id=p_store_id and m.user_id=auth.uid();
+ if v_role is null then raise exception 'Tidak terdaftar sebagai anggota toko';end if;
+ if p_doc_key<>'staff' and p_doc_key !~ '^head:[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+ and p_doc_key !~ '^cashier:[0-9]{4}-[0-9]{2}-[0-9]{2}:[123]:[12]$' then raise exception 'Kunci dokumen tidak berlaku';end if;
+ v_is_cash=p_doc_key like 'cashier:%';
+ if (p_doc_key='staff' or p_doc_key like 'head:%') and v_role='kasir' then raise exception 'Hanya kepala toko/admin boleh mengubah data';end if;
+ if v_is_cash then
+  v_day=pg_catalog.substr(p_doc_key, 9, 10)::date;
+  v_shift=pg_catalog.split_part(p_doc_key,':',3)::smallint;
+  v_slot=pg_catalog.split_part(p_doc_key,':',4)::smallint;
+  if v_role='kasir' and not exists(select 1 from public.klerek_assignments a where a.store_id=p_store_id and a.user_id=auth.uid() and a.shift=v_shift and a.slot=v_slot) then raise exception 'SLOT_NOT_ASSIGNED';end if;
+  if exists(select 1 from public.klerek_workflows w where w.store_id=p_store_id and w.work_date=v_day and w.shift=v_shift and w.slot=v_slot and w.status in ('submitted','approved')) then raise exception 'REPORT_LOCKED';end if;
+  if coalesce(pg_catalog.jsonb_typeof(p_payload->'rows'),'null')<>'array' then raise exception 'Format baris tidak valid';end if;
+ end if;
+ if p_payload is null or pg_catalog.jsonb_typeof(p_payload)<>'object' or pg_catalog.octet_length(p_payload::text)>120000 then raise exception 'Payload tidak valid';end if;
+ if coalesce(p_expected_revision,-1)<0 then raise exception 'Revision tidak valid';end if;
+ select d.revision,d.payload into v_existing,v_old from public.klerek_documents d where d.store_id=p_store_id and d.doc_key=p_doc_key for update;
+ if coalesce(v_existing,0)<>p_expected_revision then raise exception 'CLOUD_CONFLICT';end if;
+ insert into public.klerek_documents as d(store_id,doc_key,payload,revision,updated_by)
+ values(p_store_id,p_doc_key,p_payload,1,auth.uid())
+ on conflict(store_id,doc_key) do update set payload=excluded.payload,revision=d.revision+1,updated_at=now(),updated_by=auth.uid()
+ where d.revision=p_expected_revision
+ returning d.revision,d.updated_at into v_rev,v_time;
+ if not found then raise exception 'CLOUD_CONFLICT';end if;
+ insert into public.klerek_audit(store_id,actor,item_key,action,before_summary,after_summary)
+ values(p_store_id,auth.uid(),p_doc_key,'EDIT',
+  case when v_old is null then null else pg_catalog.jsonb_build_object('revision',v_existing,'bytes',pg_catalog.octet_length(v_old::text),'rows',pg_catalog.jsonb_array_length(case when pg_catalog.jsonb_typeof(v_old->'rows')='array' then v_old->'rows' else '[]'::jsonb end)) end,
+  pg_catalog.jsonb_build_object('revision',v_rev,'bytes',pg_catalog.octet_length(p_payload::text),'rows',pg_catalog.jsonb_array_length(case when pg_catalog.jsonb_typeof(p_payload->'rows')='array' then p_payload->'rows' else '[]'::jsonb end)));
+ return query select v_rev,v_time;
+end $$;
+
+-- Snapshot per tanggal, bukan seluruh database, supaya hemat kuota.
+create or replace function public.klerek_backup_day(p_store_id uuid,p_work_date date)
+returns timestamptz language plpgsql security definer set search_path='' as $$
+declare v_role text;v_doc jsonb;v_flow jsonb;v_time timestamptz;
+begin
+ select m.role into v_role from public.klerek_members m where m.store_id=p_store_id and m.user_id=auth.uid();
+ if v_role not in ('admin','kepala_toko') then raise exception 'Hanya kepala toko/admin dapat membuat backup cloud';end if;
+ select coalesce(pg_catalog.jsonb_object_agg(d.doc_key,d.payload),'{}'::jsonb) into v_doc from public.klerek_documents d
+ where d.store_id=p_store_id and (d.doc_key='staff' or d.doc_key='head:'||p_work_date::text or d.doc_key like 'cashier:'||p_work_date::text||':%');
+ select coalesce(pg_catalog.jsonb_agg(pg_catalog.to_jsonb(w)),'[]'::jsonb) into v_flow from public.klerek_workflows w where w.store_id=p_store_id and w.work_date=p_work_date;
+ if pg_catalog.octet_length(v_doc::text)>2000000 then raise exception 'Snapshot melewati 2 MB';end if;
+ insert into public.klerek_backups as b(store_id,work_date,snapshot,created_by)
+ values(p_store_id,p_work_date,pg_catalog.jsonb_build_object('documents',v_doc,'workflows',v_flow),auth.uid())
+ on conflict(store_id,work_date) do update set snapshot=excluded.snapshot,created_by=auth.uid(),created_at=now()
+ returning b.created_at into v_time;
+ -- Retensi 35 hari untuk menjaga biaya penyimpanan. Arsip transaksi TIDAK DIHAPUS.
+ delete from public.klerek_backups where store_id=p_store_id and work_date<p_work_date-35;
+ insert into public.klerek_audit(store_id,actor,item_key,action,after_summary)
+ values(p_store_id,auth.uid(),'backup:'||p_work_date,'BACKUP',pg_catalog.jsonb_build_object('work_date',p_work_date));
+ return v_time;
+end $$;
+
+-- Restore hanya data yang hilang, tidak mengganti laporan yang sudah diedit/dikunci.
+create or replace function public.klerek_restore_missing_day(p_store_id uuid,p_work_date date)
+returns integer language plpgsql security definer set search_path='' as $$
+declare v_role text;v_doc jsonb;v_key text;v_value jsonb;v_count int:=0;
+begin
+ select m.role into v_role from public.klerek_members m where m.store_id=p_store_id and m.user_id=auth.uid();
+ if v_role<>'admin' then raise exception 'Hanya admin boleh memulihkan data';end if;
+ select snapshot->'documents' into v_doc from public.klerek_backups where store_id=p_store_id and work_date=p_work_date;
+ if v_doc is null then raise exception 'Backup tanggal tersebut tidak ada';end if;
+ for v_key,v_value in select key,value from pg_catalog.jsonb_each(v_doc) loop
+  if v_key = 'head:'||p_work_date::text or (v_key ~ '^cashier:[0-9]{4}-[0-9]{2}-[0-9]{2}:[123]:[12]$' and v_key like 'cashier:'||p_work_date::text||':%') then
+   insert into public.klerek_documents(store_id,doc_key,payload,revision,updated_by)
+   values(p_store_id,v_key,v_value,1,auth.uid()) on conflict do nothing;
+   if found then v_count=v_count+1;end if;
+  end if;
+ end loop;
+ insert into public.klerek_audit(store_id,actor,item_key,action,after_summary)
+ values(p_store_id,auth.uid(),'backup:'||p_work_date,'RESTORE_MISSING',pg_catalog.jsonb_build_object('added',v_count));
+ return v_count;
+end $$;
+
+
+-- Kepala toko boleh membaca email anggota untuk mengidentifikasi pelaku audit.
+-- Tidak memberikan izin mengubah role atau kode undangan.
+create or replace function public.klerek_list_members(p_store_id uuid)
+returns table(user_id uuid,email text,role text)
+language plpgsql security definer set search_path='' as $$
+begin
+ if not exists(select 1 from public.klerek_members m where m.store_id=p_store_id and m.user_id=auth.uid() and m.role in ('admin','kepala_toko')) then
+  raise exception 'Hanya admin/kepala toko';end if;
+ return query select m.user_id,u.email::text,m.role from public.klerek_members m
+ join auth.users u on u.id=m.user_id where m.store_id=p_store_id order by m.joined_at;
+end $$;
+revoke all on function public.klerek_list_members(uuid) from public;
+grant execute on function public.klerek_list_members(uuid) to authenticated;
+
+-- Bersihkan assignment ketika user keluar dari toko / bukan kasir lagi.
+-- Perbaiki RPC administrator yang sudah ada supaya tidak meninggalkan penugasan lama.
+create or replace function public.klerek_remove_member(p_store_id uuid,p_user_id uuid)
+returns void language plpgsql security definer set search_path='' as $$
+begin
+ if not exists(select 1 from public.klerek_members where store_id=p_store_id and user_id=auth.uid() and role='admin') then raise exception 'Hanya admin';end if;
+ if exists(select 1 from public.klerek_stores where id=p_store_id and owner_id=p_user_id) then raise exception 'Pemilik tidak dapat dihapus';end if;
+ delete from public.klerek_assignments where store_id=p_store_id and user_id=p_user_id;
+ delete from public.klerek_members where store_id=p_store_id and user_id=p_user_id;
+end $$;
+create or replace function public.klerek_set_member_role(p_store_id uuid,p_user_id uuid,p_role text)
+returns void language plpgsql security definer set search_path='' as $$
+begin
+ if not exists(select 1 from public.klerek_members where store_id=p_store_id and user_id=auth.uid() and role='admin') then raise exception 'Hanya admin';end if;
+ if p_role not in ('kasir','kepala_toko','admin') then raise exception 'Peran tidak valid';end if;
+ if exists(select 1 from public.klerek_stores where id=p_store_id and owner_id=p_user_id) then raise exception 'Tidak boleh mengubah role pemilik';end if;
+ update public.klerek_members set role=p_role where store_id=p_store_id and user_id=p_user_id;
+ if not found then raise exception 'Pengguna tidak ditemukan';end if;
+ if p_role<>'kasir' then delete from public.klerek_assignments where store_id=p_store_id and user_id=p_user_id;end if;
+end $$;
+
+revoke all on function public.klerek_assign_slot(uuid,uuid,smallint,smallint) from public;
+revoke all on function public.klerek_unassign_slot(uuid,smallint,smallint) from public;
+revoke all on function public.klerek_workflow_action(uuid,date,smallint,smallint,text,bigint,text,bigint) from public;
+revoke all on function public.klerek_backup_day(uuid,date) from public;
+revoke all on function public.klerek_restore_missing_day(uuid,date) from public;
+revoke all on function public.klerek_put_document(uuid,text,jsonb,bigint) from public;
+grant execute on function public.klerek_assign_slot(uuid,uuid,smallint,smallint) to authenticated;
+grant execute on function public.klerek_unassign_slot(uuid,smallint,smallint) to authenticated;
+grant execute on function public.klerek_workflow_action(uuid,date,smallint,smallint,text,bigint,text,bigint) to authenticated;
+grant execute on function public.klerek_backup_day(uuid,date) to authenticated;
+grant execute on function public.klerek_restore_missing_day(uuid,date) to authenticated;
+grant execute on function public.klerek_put_document(uuid,text,jsonb,bigint) to authenticated;
+
+-- Realtime workflow khusus, tanpa duplikasi publikasi.
+do $$ begin
+ if exists(select 1 from pg_publication where pubname='supabase_realtime') then
+  if not exists(select 1 from pg_publication_tables where pubname='supabase_realtime' and schemaname='public' and tablename='klerek_workflows') then
+   alter publication supabase_realtime add table public.klerek_workflows;
+  end if;
+  if not exists(select 1 from pg_publication_tables where pubname='supabase_realtime' and schemaname='public' and tablename='klerek_assignments') then
+   alter publication supabase_realtime add table public.klerek_assignments;
+  end if;
+ end if;
+end $$;
