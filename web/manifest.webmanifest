@@ -1,0 +1,41 @@
+{
+  "name": "KLEREK KASIR - Cloud Multiuser + Offline",
+  "short_name": "Klerek Kasir",
+  "description": "Klerek Kasir v4: 3 shift dan 6 kasir, tutup shift & approval, monitoring, audit, backup cloud, riwayat bulanan, laporan PDF/PNG, PIN, multi-toko dan offline.",
+  "id": "./",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "display_override": [
+    "standalone"
+  ],
+  "orientation": "portrait-primary",
+  "background_color": "#071321",
+  "theme_color": "#071321",
+  "lang": "id",
+  "categories": [
+    "finance",
+    "business",
+    "productivity"
+  ],
+  "icons": [
+    {
+      "src": "./icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "./icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "./icons/icon-maskable-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}
