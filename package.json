@@ -1,0 +1,23 @@
+{
+  "name": "klerek-kasir-apk-internal",
+  "version": "4.0.0",
+  "private": true,
+  "description": "KLEREK KASIR Android internal app (Capacitor); no Play Store",
+  "scripts": {
+    "build:web": "node scripts/build-web.cjs",
+    "android:deeplink": "node scripts/setup-android.cjs",
+    "build:android-project": "npm run build:web && npx cap add android && npx cap sync android && npm run android:deeplink"
+  },
+  "dependencies": {
+    "@capacitor/app": "^8.0.0",
+    "@capacitor/core": "^8.0.0",
+    "@capacitor/android": "^8.0.0",
+    "@capacitor/filesystem": "^8.0.0",
+    "@capacitor/share": "^8.0.0",
+    "@supabase/supabase-js": "^2.57.0"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^8.0.0",
+    "esbuild": "^0.25.0"
+  }
+}

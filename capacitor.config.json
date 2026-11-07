@@ -1,0 +1,9 @@
+{
+  "appId": "com.alfianwahyu63.klerekkasir",
+  "appName": "KLEREK KASIR",
+  "webDir": "www",
+  "backgroundColor": "#071321",
+  "android": {
+    "allowMixedContent": false
+  }
+}
