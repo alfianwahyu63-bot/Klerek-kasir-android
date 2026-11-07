@@ -1,0 +1,48 @@
+name: Build KLEREK KASIR APK (Internal)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  android-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Download kode repositori
+        uses: actions/checkout@v4
+      - name: Siapkan Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Siapkan Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Siapkan Android SDK
+        uses: android-actions/setup-android@v3
+      - name: Instal library Android
+        run: npm install --no-audit --no-fund
+      - name: Build web yang tertanam di APK
+        run: npm run build:web
+      - name: Buat project Android Capacitor
+        run: npx cap add android
+      - name: Sinkronkan asset dan plugin
+        run: npx cap sync android
+      - name: Pasang deep link Supabase Auth
+        run: npm run android:deeplink
+      - name: Kompilasi APK debug internal
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew --no-daemon assembleDebug
+      - name: Upload APK hasil build
+        uses: actions/upload-artifact@v4
+        with:
+          name: KLEREK-KASIR-v4-APK-INTERNAL
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 30
